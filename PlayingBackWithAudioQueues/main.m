@@ -181,6 +181,9 @@ int main(int argc, const char * argv[]) {
     // Clean up
     CheckError(AudioQueueStop(queue, TRUE), "Stopping Audio Queue...");
     CheckError(AudioQueueDispose(queue, TRUE), "Disposing Audio Queue...");
+    if (playbackCallbackData.packetDescs) {
+      free(playbackCallbackData.packetDescs);
+    }
     CheckError(AudioFileClose(playbackCallbackData.playbackFile), "Closing audio file...");
     
     NSPrint(@"...bye!\n");

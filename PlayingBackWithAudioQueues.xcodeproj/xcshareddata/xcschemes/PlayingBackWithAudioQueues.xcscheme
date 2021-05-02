@@ -52,7 +52,7 @@
       </BuildableProductRunnable>
       <CommandLineArguments>
          <CommandLineArgument
-            argument = "music-file.mp3"
+            argument = "music-file.aiff"
             isEnabled = "YES">
          </CommandLineArgument>
       </CommandLineArguments>

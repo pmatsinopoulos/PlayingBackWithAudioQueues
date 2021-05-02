@@ -15,6 +15,39 @@
 #define kBufferDurationInSeconds 0.5
 #define kNumberOfPlaybackBuffers 3
 
+void OpenAudioFile(const char *fileName, AudioFileID *audioFile) {
+  NSString *audioFilePath = [[NSString stringWithUTF8String:fileName] stringByExpandingTildeInPath];
+  NSURL *audioURL = [NSURL fileURLWithPath:audioFilePath];
+  
+  CheckError(AudioFileOpenURL((__bridge CFURLRef)audioURL,
+                              kAudioFileReadPermission,
+                              0,
+                              audioFile), "Opening the audio file");
+}
+
+static void PrintAudioStreamBasicBasicDescription(const AudioStreamBasicDescription *inAudioStreamBasicDescription) {
+  NSPrint(@"Sample Rate: %f\n", inAudioStreamBasicDescription->mSampleRate);
+  
+  UInt32 formatID4cc = CFSwapInt32HostToBig(inAudioStreamBasicDescription->mFormatID);
+  NSPrint(@"Format ID: %4.4s\n", (char *)&formatID4cc);
+  
+  NSPrint(@"Bytes per packet: %d\n", inAudioStreamBasicDescription->mBytesPerPacket);
+  
+  NSPrint(@"Frames per packet: %d\n", inAudioStreamBasicDescription->mFramesPerPacket);
+  
+  NSPrint(@"Bytes per frame: %d\n", inAudioStreamBasicDescription->mBytesPerFrame);
+  
+  NSPrint(@"Channels per frame: %d\n", inAudioStreamBasicDescription->mChannelsPerFrame);
+
+  NSPrint(@"Bits per channel: %d\n", inAudioStreamBasicDescription->mBitsPerChannel);
+}
+
+static void PrintPacketDescription(const AudioStreamPacketDescription *inAudioStreamPacketDescription) {
+  NSPrint(@"Packet start offset: %ld\n", inAudioStreamPacketDescription->mStartOffset);
+  NSPrint(@"Variable frames in packet: %d\n", inAudioStreamPacketDescription->mVariableFramesInPacket);
+  NSPrint(@"Data size: %d\n", inAudioStreamPacketDescription->mDataByteSize);
+}
+
 static void MyAQOutputCallback(void *inUserData,
                                AudioQueueRef inAQ,
                                AudioQueueBufferRef inCompleteAQBuffer) {
@@ -24,7 +57,7 @@ static void MyAQOutputCallback(void *inUserData,
   }
   
   UInt32 numOfBytes = playbackCallbackData->numOfBytesToRead;
-  UInt32 numOfPackets = playbackCallbackData->numPacketsToRead;
+  UInt32 numOfPackets = playbackCallbackData->numOfPacketsToRead;
   CheckError(AudioFileReadPacketData(playbackCallbackData->playbackFile,
                                      false,
                                      &numOfBytes,
@@ -34,7 +67,10 @@ static void MyAQOutputCallback(void *inUserData,
                                      inCompleteAQBuffer->mAudioData), "Reading packet data from audio file");
   if (numOfPackets > 0 && numOfBytes > 0) {
     inCompleteAQBuffer->mAudioDataByteSize = numOfBytes;
-    CheckError(AudioQueueEnqueueBuffer(inAQ, inCompleteAQBuffer, numOfPackets, playbackCallbackData->packetDescs), "Audio enqueuing buffer");
+    CheckError(AudioQueueEnqueueBuffer(inAQ,
+                                       inCompleteAQBuffer,
+                                       (playbackCallbackData->packetDescs ? numOfPackets : 0),
+                                       playbackCallbackData->packetDescs), "Audio enqueuing buffer");
     playbackCallbackData->packetPosition += numOfPackets;
   }
   else {
@@ -43,7 +79,11 @@ static void MyAQOutputCallback(void *inUserData,
   }
 }
 
-void CalculateBytesForTime(AudioFileID audioFile, const AudioStreamBasicDescription* inAudioStreamBasicDescription, Float64 bufferDurationInSeconds, UInt32* oBufferByteSize, UInt32* oNumPacketsToRead) {
+void CalculateBytesForTime(AudioFileID audioFile,
+                           const AudioStreamBasicDescription* inAudioStreamBasicDescription,
+                           Float64 bufferDurationInSeconds,
+                           UInt32* oBufferByteSize,
+                           UInt32* oNumPacketsToRead) {
   UInt32 packetSizeUpperBound = 0;
   UInt32 packetSizeUpperBoundSize = sizeof(packetSizeUpperBound);
   
@@ -54,40 +94,49 @@ void CalculateBytesForTime(AudioFileID audioFile, const AudioStreamBasicDescript
                                   kAudioFilePropertyPacketSizeUpperBound,
                                   &packetSizeUpperBoundSize,
                                   &packetSizeUpperBound), "Getting the packet size uppper bound from the audio file");
-  const int maxBufferSize = 0x10000; // 64KB
+  const int maxBufferSize = 0x100000; // 128KB
   const int minBufferSize = 0x4000;  // 16KB
+  UInt32 totalNumberOfPackets = 0;
+  
   if (inAudioStreamBasicDescription->mFramesPerPacket) {
-    // VBR case
     Float64 totalNumberOfSamples = inAudioStreamBasicDescription->mSampleRate * bufferDurationInSeconds;
     UInt32 totalNumberOfFrames = ceil(totalNumberOfSamples); // 1 Frame for each 1 Sample, but round up
-    UInt32 totalNumberOfPackets = totalNumberOfFrames / inAudioStreamBasicDescription->mFramesPerPacket;
-    *oBufferByteSize = packetSizeUpperBound * totalNumberOfPackets;
+    totalNumberOfPackets = totalNumberOfFrames / inAudioStreamBasicDescription->mFramesPerPacket;
   }
   else {
-    // If frames (samples) per packet is zero, then the codec has no predictable packet size for given time
-    // So we can't tailor this (we don't know how many Packets are represent in a time period
-    // we'll just return a default buffer size
-    *oBufferByteSize = maxBufferSize > packetSizeUpperBound ? maxBufferSize : packetSizeUpperBound;
+    // If frames (samples) per packet is zero, then the codec has no predictable packet size for given time.
+    // In that case, we will assume the maximum of 1 packet to size the buffer for given duration
+    totalNumberOfPackets = 1;
   }
   
-  if (*oBufferByteSize > maxBufferSize && *oBufferByteSize > packetSizeUpperBound) {
+  if (inAudioStreamBasicDescription->mBytesPerPacket) {
+    *oBufferByteSize = inAudioStreamBasicDescription->mBytesPerPacket * totalNumberOfPackets;
+  }
+  else {
+    *oBufferByteSize = packetSizeUpperBound * totalNumberOfPackets;
+  }
+  
+  if (*oBufferByteSize > maxBufferSize) {
     // Let's not cross the limit if +maxBufferSize+
     *oBufferByteSize = maxBufferSize;
   }
-  else {
+  else if (*oBufferByteSize < minBufferSize) {
     // but also, let's make sure we are not very small
-    if (*oBufferByteSize < minBufferSize) {
-      *oBufferByteSize = minBufferSize;
-    }
+    *oBufferByteSize = minBufferSize;
   }
+  
+  // Since, we might truncate the upper size (if it is greater than the maxBufferSize),
+  // we make sure that the number of packets is good for the buffer size calculated.
   *oNumPacketsToRead = *oBufferByteSize / packetSizeUpperBound;
 }
 
-static void AllocateMemoryForPacketDescriptionsArray(const AudioStreamBasicDescription *inAudioStreamBasicDescription, PlaybackCallbackData *ioPlaybackCallbackData) {
-  Boolean isFormatVBR = inAudioStreamBasicDescription->mBytesPerPacket == 0 || inAudioStreamBasicDescription->mFramesPerPacket == 0;
-  if (isFormatVBR) {
-    // TODO: We will have to free this dynamically allocated buffer. no?
-    ioPlaybackCallbackData->packetDescs = (AudioStreamPacketDescription*) malloc(sizeof(AudioStreamBasicDescription) * ioPlaybackCallbackData->numPacketsToRead);
+static void AllocateMemoryForPacketDescriptionsArray(const AudioStreamBasicDescription *inAudioStreamBasicDescription,
+                                                     PlaybackCallbackData *ioPlaybackCallbackData) {
+  Boolean isVBRorCBRwithUnequalChannelSizes = inAudioStreamBasicDescription->mBytesPerPacket == 0 ||
+                                              inAudioStreamBasicDescription->mFramesPerPacket == 0;
+  if (isVBRorCBRwithUnequalChannelSizes) {
+    UInt32 bytesToAllocate = sizeof(AudioStreamBasicDescription) * ioPlaybackCallbackData->numOfPacketsToRead;
+    ioPlaybackCallbackData->packetDescs = (AudioStreamPacketDescription*) malloc(bytesToAllocate);
   }
   else {
     ioPlaybackCallbackData->packetDescs = NULL;
@@ -123,25 +172,22 @@ int main(int argc, const char * argv[]) {
     
     NSPrint(@"Starting ...\n");
     
-    // Get the file name in a URL
-    NSString *audioFilePath = [[NSString stringWithUTF8String:argv[1]] stringByExpandingTildeInPath];
-    NSURL *audioURL = [NSURL fileURLWithPath:audioFilePath];
-    
-    
     PlaybackCallbackData playbackCallbackData = {0};
     
-    CheckError(AudioFileOpenURL((__bridge CFURLRef)audioURL,
-                                kAudioFileReadPermission,
-                                0,
-                                &playbackCallbackData.playbackFile), "Opening the audio file");
-    
+    OpenAudioFile(argv[1], &playbackCallbackData.playbackFile);
+        
     AudioStreamBasicDescription audioStreamBasicDescription;
     UInt32 audioStreamBasicDescriptionSize = sizeof(AudioStreamBasicDescription);
     CheckError(AudioFileGetProperty(playbackCallbackData.playbackFile,
                                     kAudioFilePropertyDataFormat,
                                     &audioStreamBasicDescriptionSize,
                                     &audioStreamBasicDescription), "Getting the audio stream basic description need from the audio file");
-    
+
+    NSPrint(@"Audio Stream Basic Description\n");
+    PrintAudioStreamBasicBasicDescription(&audioStreamBasicDescription);
+    NSPrint(@"...click <Enter> to continue...");
+    getchar();
+
     AudioQueueRef queue;
     CheckError(AudioQueueNewOutput(&audioStreamBasicDescription,
                                    MyAQOutputCallback,
@@ -149,22 +195,29 @@ int main(int argc, const char * argv[]) {
                                    NULL, NULL, 0,
                                    &queue), "Initializing the audio queue");
     
+    CopyEncoderMagicCookieToAudioQueue(playbackCallbackData.playbackFile, queue);
+    
     CalculateBytesForTime(playbackCallbackData.playbackFile,
                           &audioStreamBasicDescription,
                           kBufferDurationInSeconds,
                           &playbackCallbackData.numOfBytesToRead,
-                          &playbackCallbackData.numPacketsToRead);
+                          &playbackCallbackData.numOfPacketsToRead);
+    
+    NSLog(@"Number of bytes for buffer: %d\n", playbackCallbackData.numOfBytesToRead);
+    NSLog(@"Number of packets for buffer: %d\n", playbackCallbackData.numOfPacketsToRead);
+    NSPrint(@"...click <Enter> to continue...");
+    getchar();
     
     AllocateMemoryForPacketDescriptionsArray(&audioStreamBasicDescription, &playbackCallbackData);
-    
-    CopyEncoderMagicCookieToAudioQueue(playbackCallbackData.playbackFile, queue);
     
     // allocate audio queue buffers and fill them in with initial data using the callback function
     AudioQueueBufferRef buffers[kNumberOfPlaybackBuffers];
     playbackCallbackData.isDone = FALSE;
     playbackCallbackData.packetPosition = 0;
     for (int i = 0; i < kNumberOfPlaybackBuffers; i++) {
-      CheckError(AudioQueueAllocateBuffer(queue, playbackCallbackData.numOfBytesToRead, &buffers[i]), "Allocating audio queue buffer");
+      CheckError(AudioQueueAllocateBuffer(queue,
+                                          playbackCallbackData.numOfBytesToRead,
+                                          &buffers[i]), "Allocating audio queue buffer");
       
       MyAQOutputCallback(&playbackCallbackData, queue, buffers[i]); // Note: The actual enqueueing of the buffer is done by the callback itself.
       if (playbackCallbackData.isDone) { // just in case the audio is less than 1.5 seconds (kNumberOfPlaybackBuffers * kBufferDurationInSeconds)
@@ -172,11 +225,18 @@ int main(int argc, const char * argv[]) {
       }
     }
     
+    if (playbackCallbackData.isDone) {
+      NSPrint(@"...bye!\n");
+      return ;
+    }
+    
     NSPrint(@"Playing...Click <Enter> to terminate program\n");
     
     CheckError(AudioQueueStart(queue, NULL), "Audio queue start....the playback");
     
     getchar();
+    
+    playbackCallbackData.isDone = true;
     
     // Clean up
     CheckError(AudioQueueStop(queue, TRUE), "Stopping Audio Queue...");

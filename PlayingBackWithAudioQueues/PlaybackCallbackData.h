@@ -15,7 +15,7 @@ typedef struct PlaybackCallbackData {
   AudioFileID                   playbackFile;
   SInt64                        packetPosition;
   UInt32                        numOfBytesToRead;
-  UInt32                        numPacketsToRead;
+  UInt32                        numOfPacketsToRead;
   AudioStreamPacketDescription* packetDescs;
   Boolean                       isDone;
 } PlaybackCallbackData;
